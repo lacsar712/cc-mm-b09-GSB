@@ -11,6 +11,9 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 from app.rules import classify
 
+DEFAULT_STICKY_THRESHOLD = 0.05
+STICKY_THRESHOLD_KEY = "sticky_threshold"
+
 
 class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg2://app:app@localhost:54391/methane"
@@ -44,6 +47,28 @@ class Reading(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[float] = mapped_column(Float)
+    updated_by: Mapped[str] = mapped_column(String(64))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class StickyLedgerEntry(Base):
+    """可疑册：检出即冻结，之后改门槛不动旧行。"""
+
+    __tablename__ = "sticky_ledger"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site: Mapped[str] = mapped_column(String(80))
+    threshold: Mapped[float] = mapped_column(Float)
+    prev_reading_id: Mapped[int] = mapped_column()
+    curr_reading_id: Mapped[int] = mapped_column(unique=True)
+    diff: Mapped[float] = mapped_column(Float)
+    created_by: Mapped[str] = mapped_column(String(64))
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -52,6 +77,10 @@ class LoginIn(BaseModel):
 class ReadingIn(BaseModel):
     site: str = Field(min_length=1, max_length=80)
     ch4_pct: float
+
+
+class ThresholdIn(BaseModel):
+    threshold: float = Field(ge=0)
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -69,8 +98,13 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(secu
 
 def require_writer(user: dict = Depends(current_user)) -> dict:
     if user["role"] != "writer":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅瓦斯检查员可上报")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅瓦斯检查员可操作")
     return user
+
+
+def get_threshold(db: Session) -> float:
+    row = db.get(AppSetting, STICKY_THRESHOLD_KEY)
+    return row.value if row is not None else DEFAULT_STICKY_THRESHOLD
 
 
 sockets: set[WebSocket] = set()
@@ -144,6 +178,7 @@ def list_readings(_user: dict = Depends(current_user)):
 async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
     level, note = classify(body.ch4_pct)
     db = SessionLocal()
+    sticky = None
     try:
         row = Reading(
             site=body.site.strip(),
@@ -156,7 +191,46 @@ async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
         db.add(row)
         db.commit()
         db.refresh(row)
-        payload = {"id": row.id, "site": row.site, "ch4_pct": row.ch4_pct, "level": row.level, "note": row.note}
+
+        prev = (
+            db.query(Reading)
+            .filter(Reading.site == row.site, Reading.id != row.id)
+            .order_by(Reading.created_at.desc(), Reading.id.desc())
+            .first()
+        )
+        if prev is not None:
+            threshold = get_threshold(db)
+            diff = round(abs(row.ch4_pct - prev.ch4_pct), 6)
+            if diff < threshold:
+                detected_at = datetime.now(timezone.utc)
+                db.add(
+                    StickyLedgerEntry(
+                        site=row.site,
+                        threshold=threshold,
+                        prev_reading_id=prev.id,
+                        curr_reading_id=row.id,
+                        diff=diff,
+                        created_by=user["username"],
+                        detected_at=detected_at,
+                    )
+                )
+                db.commit()
+                sticky = {
+                    "site": row.site,
+                    "prev_reading_id": prev.id,
+                    "curr_reading_id": row.id,
+                    "threshold": threshold,
+                    "diff": diff,
+                    "detected_at": detected_at.isoformat(),
+                }
+        payload = {
+            "id": row.id,
+            "site": row.site,
+            "ch4_pct": row.ch4_pct,
+            "level": row.level,
+            "note": row.note,
+            "sticky": sticky,
+        }
     finally:
         db.close()
     dead = []
@@ -168,6 +242,101 @@ async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
     for ws in dead:
         sockets.discard(ws)
     return payload
+
+
+@app.get("/api/sticky/threshold")
+def read_threshold(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        return {"threshold": get_threshold(db)}
+    finally:
+        db.close()
+
+
+@app.put("/api/sticky/threshold")
+def update_threshold(body: ThresholdIn, user: dict = Depends(require_writer)):
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        row = db.get(AppSetting, STICKY_THRESHOLD_KEY)
+        if row is None:
+            row = AppSetting(key=STICKY_THRESHOLD_KEY, value=body.threshold, updated_by=user["username"], updated_at=now)
+            db.add(row)
+        else:
+            row.value = body.threshold
+            row.updated_by = user["username"]
+            row.updated_at = now
+        db.commit()
+        return {"threshold": body.threshold}
+    finally:
+        db.close()
+
+
+def _sticky_pairs(db: Session, threshold: float) -> list[dict]:
+    """按测点时间顺序取相邻两笔，浓度差绝对值小于当前门槛即为现场可疑。"""
+
+    rows = db.query(Reading).order_by(Reading.site.asc(), Reading.created_at.asc(), Reading.id.asc()).all()
+    by_site: dict[str, list[Reading]] = {}
+    for r in rows:
+        by_site.setdefault(r.site, []).append(r)
+    pairs = []
+    for site, items in by_site.items():
+        for prev, curr in zip(items, items[1:]):
+            diff = round(abs(curr.ch4_pct - prev.ch4_pct), 6)
+            if diff < threshold:
+                pairs.append(
+                    {
+                        "site": site,
+                        "prev_reading_id": prev.id,
+                        "curr_reading_id": curr.id,
+                        "prev_ch4_pct": prev.ch4_pct,
+                        "curr_ch4_pct": curr.ch4_pct,
+                        "diff": diff,
+                        "prev_created_at": prev.created_at.isoformat(),
+                        "curr_created_at": curr.created_at.isoformat(),
+                    }
+                )
+    pairs.sort(key=lambda p: (p["curr_created_at"], p["curr_reading_id"]), reverse=True)
+    return pairs
+
+
+@app.get("/api/sticky/live")
+def sticky_live(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        threshold = get_threshold(db)
+        return {"threshold": threshold, "pairs": _sticky_pairs(db, threshold)}
+    finally:
+        db.close()
+
+
+@app.get("/api/sticky/ledger")
+def sticky_ledger(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        readings = {r.id: r for r in db.query(Reading).all()}
+        entries = db.query(StickyLedgerEntry).order_by(StickyLedgerEntry.id.desc()).all()
+        result = []
+        for e in entries:
+            prev = readings.get(e.prev_reading_id)
+            curr = readings.get(e.curr_reading_id)
+            result.append(
+                {
+                    "id": e.id,
+                    "site": e.site,
+                    "threshold": e.threshold,
+                    "prev_reading_id": e.prev_reading_id,
+                    "curr_reading_id": e.curr_reading_id,
+                    "prev_ch4_pct": prev.ch4_pct if prev is not None else None,
+                    "curr_ch4_pct": curr.ch4_pct if curr is not None else None,
+                    "diff": e.diff,
+                    "created_by": e.created_by,
+                    "detected_at": e.detected_at.isoformat(),
+                }
+            )
+        return {"entries": result}
+    finally:
+        db.close()
 
 
 @app.websocket("/ws/alerts")
